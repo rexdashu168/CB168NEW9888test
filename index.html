@@ -4195,7 +4195,8 @@ button:active, .clickable:active {
 
 <!-- ========== v3.99a: Tab B：大盤市場資訊 ========== -->
 <div id="rightContentMarket" style="display:none;">
-id="marketCycleCard" style="background:linear-gradient(135deg, #1a237e 0%, #283593 50%, #3949ab 100%); color:white; padding:15px 18px; border-radius:12px; margin-bottom:15px; box-shadow:0 4px 15px rgba(26,35,126,0.3); cursor:pointer;" onclick="showMarketCycleDetail()">
+
+<div id="marketCycleCard" style="background:linear-gradient(135deg, #1a237e 0%, #283593 50%, #3949ab 100%); color:white; padding:15px 18px; border-radius:12px; margin-bottom:15px; box-shadow:0 4px 15px rgba(26,35,126,0.3); cursor:pointer;" onclick="showMarketCycleDetail()">
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
         <div style="display:flex; align-items:center; gap:12px;">
             <span style="font-size:28px;">🔄</span>
@@ -29161,14 +29162,48 @@ async function loadHotStockData() {
             });
         }
         
-        // 載入上市和上櫃資料庫
-        const [tseResponse, otcResponse] = await Promise.all([
-            fetch('data/stock_price_2025.db'),
-            fetch('data/otc_price_2025.db')
-        ]);
-        
+        // 載入上市和上櫃資料（優先 CSV，fallback DB）
+        const currentYear = new Date().getFullYear();
+        let tseResponse, otcResponse;
+        let useCsv = false;
+
+        // 先嘗試當年 CSV
+        tseResponse = await fetch(`data/stock_price_${currentYear}.csv`);
+        otcResponse = await fetch(`data/otc_price_${currentYear}.csv`);
+
+        if (tseResponse.ok && otcResponse.ok) {
+            useCsv = true;
+        } else {
+            // fallback: 上一年 DB
+            const prevYear = currentYear - 1;
+            tseResponse = await fetch(`data/stock_price_${prevYear}.db`);
+            otcResponse = await fetch(`data/otc_price_${prevYear}.db`);
+        }
+
         if (!tseResponse.ok || !otcResponse.ok) {
-            throw new Error('無法載入資料庫檔案');
+            throw new Error('無法載入股價資料');
+        }
+
+        // CSV 模式
+        if (useCsv) {
+            const [tseText, otcText] = await Promise.all([
+                tseResponse.text(),
+                otcResponse.text()
+            ]);
+            const tseRows = parseStockPriceCSV(tseText);
+            const otcRows = parseStockPriceCSV(otcText);
+            const allStocks = [
+                ...processStockData(tseRows.map(r=>[r.date,r.code,r.name,r.volume,r.value,r.open,r.high,r.low,r.close,r.trades]), 
+                    ['Date','Code','Name','Volume','Value','Open','High','Low','Close','Trades'], '上市'),
+                ...processStockData(otcRows.map(r=>[r.date,r.code,r.name,r.volume,r.value,r.open,r.high,r.low,r.close,r.trades]),
+                    ['Date','Code','Name','Volume','Value','Open','High','Low','Close','Trades'], '上櫃')
+            ];
+            const hotStocks = allStocks.filter(s => s.Value_M >= 50);
+            hotStockDataCache = hotStocks;
+            hotStockDataLoaded = true;
+            const dataInfo = document.getElementById('stockRankingDataInfo');
+            if (dataInfo) dataInfo.textContent = `共 ${hotStocks.length} 檔熱門股票`;
+            return hotStocks;
         }
         
         const [tseBuffer, otcBuffer] = await Promise.all([
