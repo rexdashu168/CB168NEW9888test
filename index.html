@@ -29162,42 +29162,123 @@ async function loadHotStockData() {
             });
         }
         
-        // 載入上市和上櫃資料（優先 CSV，fallback DB）
+        // 載入上市和上櫃資料（優先 xlsx，fallback CSV，再 fallback DB）
         const currentYear = new Date().getFullYear();
         let tseResponse, otcResponse;
+        let useXlsx = false;
         let useCsv = false;
 
-        // 先嘗試當年 CSV
-        tseResponse = await fetch(`data/stock_price_${currentYear}.csv`);
-        otcResponse = await fetch(`data/otc_price_${currentYear}.csv`);
+        // 先嘗試當年 xlsx
+        tseResponse = await fetch(`data/stock_price_${currentYear}.xlsx`);
+        otcResponse = await fetch(`data/otc_price_${currentYear}.xlsx`);
 
         if (tseResponse.ok && otcResponse.ok) {
-            useCsv = true;
+            useXlsx = true;
         } else {
-            // fallback: 上一年 DB
-            const prevYear = currentYear - 1;
-            tseResponse = await fetch(`data/stock_price_${prevYear}.db`);
-            otcResponse = await fetch(`data/otc_price_${prevYear}.db`);
+            // 嘗試 CSV
+            tseResponse = await fetch(`data/stock_price_${currentYear}.csv`);
+            otcResponse = await fetch(`data/otc_price_${currentYear}.csv`);
+            if (tseResponse.ok && otcResponse.ok) {
+                useCsv = true;
+            } else {
+                // fallback: 上一年 DB
+                const prevYear = currentYear - 1;
+                tseResponse = await fetch(`data/stock_price_${prevYear}.db`);
+                otcResponse = await fetch(`data/otc_price_${prevYear}.db`);
+            }
         }
 
         if (!tseResponse.ok || !otcResponse.ok) {
             throw new Error('無法載入股價資料');
         }
 
-        // CSV 模式
-        // parseStockPriceCSV 回傳陣列格式：[date, code, name, open, high, low, close, volume, amount]
+        // xlsx 模式 - 用 SheetJS 讀取最新工作表
+        if (useXlsx) {
+            // XLSX 已在 head 載入為全域變數
+            const [tseBuf, otcBuf] = await Promise.all([
+                tseResponse.arrayBuffer(),
+                otcResponse.arrayBuffer()
+            ]);
+
+            function getLatestSheetData(buf) {
+                const wb = XLSX.read(buf, { type: 'array' });
+                // 取最後一個工作表（最新日期）
+                const sheetName = wb.SheetNames[wb.SheetNames.length - 1];
+                const ws = wb.Sheets[sheetName];
+                return XLSX.utils.sheet_to_json(ws, { header: 1 }).slice(1); // 跳過表頭
+            }
+
+            function buildHotStocksXlsx(rows, market) {
+                // 欄位: 代號,名稱,成交量,成交值,開盤,最高,最低,收盤,成交筆數
+                return rows.map(r => {
+                    const code = String(r[0] || '').trim();
+                    const name = String(r[1] || '').trim();
+                    const value = parseFloat(r[3]) || 0;
+                    const close = parseFloat(r[7]) || 0;
+                    if (!code || close <= 0) return null;
+                    return { Code:code, Name:name, Market:market, Close:close,
+                             Volume:parseInt(r[2])||0, Value_M:value/1000000,
+                             Change_1D:0, Change_3D:0, Change_5D:0,
+                             Change_10D:0, Change_20D:0, Change_60D:0,
+                             Strength:0, Margin_Change:null, Short_Balance:null };
+                }).filter(r => r !== null);
+            }
+
+            const tseRows = getLatestSheetData(tseBuf);
+            const otcRows = getLatestSheetData(otcBuf);
+            const allStocks = [
+                ...buildHotStocksXlsx(tseRows, '上市'),
+                ...buildHotStocksXlsx(otcRows, '上櫃')
+            ];
+            const hotStocks = allStocks.filter(s => s.Value_M >= 50);
+            hotStockDataCache = hotStocks;
+            hotStockDataLoaded = true;
+            const dataInfo = document.getElementById('stockRankingDataInfo');
+            if (dataInfo) dataInfo.textContent = `共 ${hotStocks.length} 檔熱門股票`;
+            return hotStocks;
+        }
+
+        // CSV 模式 - 只取最新一個交易日
         if (useCsv) {
             const [tseText, otcText] = await Promise.all([
                 tseResponse.text(),
                 otcResponse.text()
             ]);
-            const tseRows = parseStockPriceCSV(tseText);
-            const otcRows = parseStockPriceCSV(otcText);
-            // parseStockPriceCSV 回傳陣列格式：[date, code, name, open, high, low, close, volume, amount]
-            const cols = ['Date','Code','Name','Open','High','Low','Close','Volume','Value'];
+
+            function getLatestDayRows(csvText) {
+                const lines = csvText.trim().split('\n');
+                if (lines.length < 2) return [];
+                const headers = lines[0].split(',').map(h => h.trim());
+                const dateIdx = headers.findIndex(h => h === '日期');
+                if (dateIdx < 0) return [];
+                let maxDate = '';
+                for (let i = 1; i < lines.length; i++) {
+                    const d = (lines[i].split(',')[dateIdx] || '').trim();
+                    if (d > maxDate) maxDate = d;
+                }
+                return lines.slice(1).filter(l => (l.split(',')[dateIdx] || '').trim() === maxDate)
+                            .map(l => l.split(','));
+            }
+
+            function buildHotStocks(rows, market) {
+                // 欄位順序: 日期,代號,名稱,成交量,成交值,開盤,最高,最低,收盤,成交筆數
+                return rows.map(c => {
+                    const code = (c[1]||'').trim();
+                    const name = (c[2]||'').trim();
+                    const value = parseFloat(c[4]) || 0;
+                    const close = parseFloat(c[8]) || 0;
+                    if (!code || close <= 0) return null;
+                    return { Code:code, Name:name, Market:market, Close:close,
+                             Volume:parseInt(c[3])||0, Value_M:value/1000000,
+                             Change_1D:0, Change_3D:0, Change_5D:0,
+                             Change_10D:0, Change_20D:0, Change_60D:0,
+                             Strength:0, Margin_Change:null, Short_Balance:null };
+                }).filter(r => r !== null);
+            }
+
             const allStocks = [
-                ...processStockData(tseRows, cols, '上市'),
-                ...processStockData(otcRows, cols, '上櫃')
+                ...buildHotStocks(getLatestDayRows(tseText), '上市'),
+                ...buildHotStocks(getLatestDayRows(otcText), '上櫃')
             ];
             const hotStocks = allStocks.filter(s => s.Value_M >= 50);
             hotStockDataCache = hotStocks;
@@ -29837,12 +29918,48 @@ const CBASHistoryManager = {
     },
     
     /**
-     * v3.98i: 載入指定年份（CSV優先，DB備用）
+     * v3.99a: 載入指定年份（2026+ xlsx優先，其他 CSV > DB）
      */
     async loadYear(year) {
         if (this.loadedYears.has(year)) return true;
-        
-        // v3.98i: 優先嘗試 CSV
+
+        // 2026+ 優先嘗試 XLSX
+        if (year >= 2026) {
+            try {
+                const xlsxResponse = await fetch(`data/CBAS_${year}.xlsx`);
+                if (xlsxResponse.ok) {
+                    const buf = await xlsxResponse.arrayBuffer();
+                    const wb = XLSX.read(buf, { type: 'array' });
+                    let count = 0;
+                    for (const sheetName of wb.SheetNames) {
+                        const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1 }).slice(1);
+                        rows.forEach(r => {
+                            const code = String(r[0] || '').trim();
+                            if (!code) return;
+                            if (!this.data[code]) this.data[code] = [];
+                            this.data[code].push({
+                                date: sheetName,
+                                cbName: String(r[1] || ''),
+                                principal: parseInt(r[2]) || 0,
+                                trades: parseInt(r[3]) || 0,
+                                minPremium: parseFloat(r[4]) || 0,
+                                maxPremium: parseFloat(r[5]) || 0,
+                                avgPremium: parseFloat(r[6]) || 0,
+                                period: parseInt(r[7]) || 0
+                            });
+                            count++;
+                        });
+                    }
+                    if (count > 0) {
+                        this.loadedYears.add(year);
+                        console.log(`✓ CBAS_${year}.xlsx 載入完成: ${count} 筆`);
+                        return true;
+                    }
+                }
+            } catch (e) { /* XLSX 失敗，繼續 */ }
+        }
+
+        // 優先嘗試 CSV
         try {
             const csvResponse = await fetch(`data/CBAS_${year}.csv`);
             if (csvResponse.ok) {
@@ -31313,8 +31430,22 @@ async function loadAllKanbanData(loadAll = false) {
 
         console.log(`📊 準備載入 CB_kanban: ${yearsToLoad.join(', ')} (CSV優先)`);
 
-        // v3.98i: 載入單年資料的輔助函數（CSV > DB > XLSX）
+        // v3.99a: 載入單年資料（2026+ 用 XLSX，2025以前 CSV > DB）
         const loadYearData = async (year) => {
+            // 2026+ 優先嘗試 XLSX
+            if (year >= 2026) {
+                try {
+                    const xlsxResponse = await fetch(`data/CB_kanban_${year}.xlsx`);
+                    if (xlsxResponse.ok) {
+                        const buffer = await xlsxResponse.arrayBuffer();
+                        const count = await parseKanbanExcel(buffer, allData, allDates);
+                        if (count > 0) {
+                            console.log(`  ✓ CB_kanban_${year}.xlsx: ${count} 筆`);
+                            return true;
+                        }
+                    }
+                } catch (e) { /* XLSX 失敗，繼續 */ }
+            }
             // 1. 優先嘗試 CSV
             try {
                 const csvResponse = await fetch(`data/CB_kanban_${year}.csv`);
@@ -33340,7 +33471,49 @@ const CBPriceManager = {
         }
         
         this.loadingYears.add(year);
-        
+
+        // v3.99a: 2026+ 優先嘗試 XLSX
+        if (year >= 2026) {
+            try {
+                const xlsxResponse = await fetch(`data/CB_price_${year}.xlsx`);
+                if (xlsxResponse.ok) {
+                    const buf = await xlsxResponse.arrayBuffer();
+                    const wb = XLSX.read(buf, { type: 'array' });
+                    let count = 0;
+                    for (const sheetName of wb.SheetNames) {
+                        const dateNum = parseInt(sheetName) || 0;
+                        if (!dateNum) continue;
+                        const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1 }).slice(1);
+                        rows.forEach(r => {
+                            const code = String(r[0] || '').trim();
+                            if (!code) return;
+                            if (!this.data[code]) this.data[code] = [];
+                            this.data[code].push({
+                                date: sheetName,
+                                dateNum: dateNum,
+                                year: year,
+                                name: String(r[1] || ''),
+                                close: parseFloat(r[2]) || 0,
+                                change: parseFloat(r[3]) || 0,
+                                open: parseFloat(r[4]) || 0,
+                                high: parseFloat(r[5]) || 0,
+                                low: parseFloat(r[6]) || 0,
+                                volume: parseFloat(r[7]) || 0,
+                                amount: parseFloat(r[9]) || 0
+                            });
+                            count++;
+                        });
+                    }
+                    if (count > 0) {
+                        console.log(`  ✓ CB_price_${year}.xlsx: ${count} 筆`);
+                        this.loadedYears.add(year);
+                        this.loadingYears.delete(year);
+                        return true;
+                    }
+                }
+            } catch (e) { /* XLSX 失敗，繼續 */ }
+        }
+
         // v3.98i: 優先嘗試 CSV
         try {
             const csvResponse = await fetch(`data/CB_price_${year}.csv`);
