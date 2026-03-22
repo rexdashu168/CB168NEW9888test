@@ -29185,6 +29185,7 @@ async function loadHotStockData() {
         }
 
         // CSV 模式
+        // parseStockPriceCSV 回傳陣列格式：[date, code, name, open, high, low, close, volume, amount]
         if (useCsv) {
             const [tseText, otcText] = await Promise.all([
                 tseResponse.text(),
@@ -29192,11 +29193,11 @@ async function loadHotStockData() {
             ]);
             const tseRows = parseStockPriceCSV(tseText);
             const otcRows = parseStockPriceCSV(otcText);
+            // parseStockPriceCSV 回傳陣列格式：[date, code, name, open, high, low, close, volume, amount]
+            const cols = ['Date','Code','Name','Open','High','Low','Close','Volume','Value'];
             const allStocks = [
-                ...processStockData(tseRows.map(r=>[r.date,r.code,r.name,r.volume,r.value,r.open,r.high,r.low,r.close,r.trades]), 
-                    ['Date','Code','Name','Volume','Value','Open','High','Low','Close','Trades'], '上市'),
-                ...processStockData(otcRows.map(r=>[r.date,r.code,r.name,r.volume,r.value,r.open,r.high,r.low,r.close,r.trades]),
-                    ['Date','Code','Name','Volume','Value','Open','High','Low','Close','Trades'], '上櫃')
+                ...processStockData(tseRows, cols, '上市'),
+                ...processStockData(otcRows, cols, '上櫃')
             ];
             const hotStocks = allStocks.filter(s => s.Value_M >= 50);
             hotStockDataCache = hotStocks;
